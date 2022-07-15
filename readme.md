@@ -1,3 +1,9 @@
+# Steven notes:
+
+To run weight decay experiments and ALICE experiments, see `run_{alice,weight_decay}.sh`.
+In addition to the standard requirements for CUAD, also install `pip install vat-pytorch==0.0.6`.
+
+
 # Contract Understanding Atticus Dataset
 
 This repository contains code for the [Contract Understanding Atticus Dataset (CUAD)](https://www.atticusprojectai.org/cuad), pronounced "kwad", a dataset for legal contract review curated by the Atticus Project. It is part of the associated paper [CUAD: An Expert-Annotated NLP Dataset for Legal Contract Review](https://arxiv.org/abs/2103.06268) by [Dan Hendrycks](http://danhendrycks.com/), [Collin Burns](http://collinpburns.com), Anya Chen, and Spencer Ball.
