@@ -55,6 +55,224 @@ except ImportError:
     from tensorboardX import SummaryWriter
 
 
+## ALICE imports
+from typing import Union, Callable, List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+from itertools import count
+from vat_pytorch.utils import default, inf_norm, kl_loss
+##
+
+class ALICEQAModel(nn.Module):
+    def __init__(self, extracted_model, args):
+        super().__init__()
+        self.model = extracted_model
+        self.vat_loss = ALICELossForQA(
+            model=extracted_model,
+            loss_fn=kl_loss,
+            alpha=args.vat_loss_weight,
+            step_size=args.step_size,
+            epsilon=args.epsilon,
+            noise_var=args.noise_var,
+        )
+
+    def forward(self, *args, use_classic: bool = True, **kwargs):
+        if not use_classic:
+            return self.forward_ours(*args, **kwargs)
+        else:
+            return self.model(*args, **kwargs)
+
+    def forward_ours(self, input_ids, attention_mask, start_positions, end_positions):
+        """input_ids: (b, s), attention_mask: (b, s), labels: (b,)"""
+        # Get input embeddings
+        embeddings = self.model.get_embeddings(input_ids)
+        # Set iteration specific data (e.g. attention mask)
+        self.model.set_attention_mask(attention_mask)
+        # Compute logits
+        both_logits = self.model(embeddings, use_classic=False)
+        both_labels = [start_positions, end_positions]
+        # Compute VAT loss
+        loss = self.vat_loss(embeddings, both_logits, both_labels)
+        return both_logits, loss
+
+
+class ExtractedRoBERTaForQA(nn.Module):
+    def __init__(self, model=None):
+        super().__init__()
+        if model is None:
+            model = transformers.AutoModelForQuestionAnswering.from_pretrained("roberta-base")
+        self.model = model
+        self.roberta = model.roberta
+        self.layers = model.roberta.encoder.layer
+        self.attention_mask = None
+        self.num_layers = len(self.layers) - 1
+
+    def forward(self, *args, use_classic=True, **kwargs):
+        if use_classic:
+            return self.model(*args, **kwargs)
+        else:
+            return self.forward_ours(*args, **kwargs)
+
+    def forward_ours(self, hidden, with_hidden_states=False, start_layer=0):
+        """Forwards the hidden value from self.start_layer layer to the logits."""
+        assert not with_hidden_states
+        hidden_states = [hidden]
+
+        for layer in self.layers[start_layer:]:
+            hidden = layer(hidden, attention_mask=self.attention_mask)[0]
+            hidden_states += [hidden]
+
+        logits = self.model.qa_outputs(hidden)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+        return [start_logits, end_logits]
+
+    def get_embeddings(self, input_ids):
+        """Computes first embedding layer given inputs_ids"""
+        return self.roberta.embeddings(input_ids)
+
+    def set_attention_mask(self, attention_mask):
+        """Sets the correct mask on all subsequent forward passes"""
+        self.attention_mask = self.roberta.get_extended_attention_mask(
+            attention_mask,
+            input_shape=attention_mask.shape,
+            device=attention_mask.device,
+        )  # (b, 1, 1, s)
+
+
+class ALICELossForQA(nn.Module):
+    def __init__(
+            self,
+            model: nn.Module,
+            loss_fn: Callable,
+            loss_last_fn: Callable = None,
+            gold_loss_fn: Callable = None,
+            gold_loss_last_fn: Callable = None,
+            norm_fn: Callable = inf_norm,
+            alpha: float = 1,
+            num_steps: int = 1,
+            step_size: float = 1e-3,
+            epsilon: float = 1e-6,
+            noise_var: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.loss_fn = loss_fn
+        self.loss_last_fn = default(loss_last_fn, loss_fn)
+        self.gold_loss_fn = default(gold_loss_fn, loss_fn)
+        self.gold_loss_last_fn = default(
+            default(gold_loss_last_fn, self.gold_loss_fn), self.loss_last_fn
+        )
+        self.norm_fn = norm_fn
+        self.alpha = alpha
+        self.num_steps = num_steps
+        self.step_size = step_size
+        self.epsilon = epsilon
+        self.noise_var = noise_var
+
+    def forward(self, embed: Tensor, state: List[Tensor], labels: List[Tensor], ignored_index: Optional[int]=None) -> Tensor:
+        assert isinstance(state, list)
+        assert isinstance(labels, list)   # Labels are going to be the start and end positions.
+        assert len(state) == len(labels)
+        assert len(state) == 2
+
+        if ignored_index is not None:
+            raise NotImplementedError
+
+        # state is the virtual labels -- the start_logits and end_logits
+        virtual_loss = self.get_perturbed_loss(
+            embed=embed, states=state, loss_fn=self.loss_fn, loss_last_fn=self.loss_last_fn,
+        )
+
+        # TODO(shwang): I can't implement ignored_index in time I think.
+        #   I would have to modify the JS loss etc. to drop all indices that have ignored_index.
+        #   That probably wouldn't be technically too hard, but I'll leave it for future work.
+        start_pos, end_pos = labels
+        start_logits, end_logits = state
+
+        # n_classes = start_logits.size(1)
+        # def mask_outside_of_range(x: torch.tensor, start: int, end: int):
+        #     mask = torch.logical_and(x >= start, x < end)
+        #     return mask
+        # start_mask = mask_outside_of_range(start_pos, 0, n_classes)
+        # end_mask = mask_outside_of_range(end_pos, 0, n_classes)
+        # mask = torch.logical_and(start_mask, end_mask)
+        # start_pos_masked = start_pos[mask]
+        # end_pos_masked = end_pos[mask]
+
+        # sometimes the start/end positions are outside our model inputs, we ignore these terms
+        # by masking out x
+        # TODO(shwang): Maybe I need to pass ignored_index to the loss_fn, and clamp to max=ignored_index.
+        n_classes = start_logits.size(1)
+        ignored_index = n_classes
+        start_pos = start_pos.clamp(0, ignored_index - 1)
+        end_pos = end_pos.clamp(0, ignored_index - 1)
+
+        labels_one_hot = [
+            F.one_hot(start_pos, num_classes=n_classes).float(),
+            F.one_hot(end_pos, num_classes=n_classes).float(),
+        ]
+
+        # TODO(shwang): I think that labels_one_hot might be interpretted as logits later.
+        #   Possible bug, or maybe I don't understand what sort of inputs the divergence functions expect
+        #   as `target`. But why would you log_softmax a onehot? That makes no sense.
+        # state here is the actual labels -- starts and end positions as one hot.
+        # (but prob should actually be logits, so we should multiply by ten or something.)
+
+        labels_loss = self.get_perturbed_loss(
+            embed=embed,
+            states=labels_one_hot,
+            # labels=labels_one_hot,
+            loss_fn=self.gold_loss_fn,
+            loss_last_fn=self.gold_loss_last_fn,
+        )
+        return labels_loss + self.alpha * virtual_loss
+
+    @torch.enable_grad()
+    def get_perturbed_loss(
+            self, embed: Tensor, states: List[Tensor],
+            loss_fn: Callable, loss_last_fn: Callable
+    ):
+        noise = torch.randn_like(embed, requires_grad=True) * self.noise_var
+        assert isinstance(states, list)
+
+        # Indefinite loop with counter
+        for i in count():
+            # Compute perturbed embed and states
+            embed_perturbed = embed + noise
+            states_perturbed = self.model(embed_perturbed, use_classic=False)
+            if not isinstance(states_perturbed, list):
+                states_perturbed = [states_perturbed]
+            assert len(states) == len(states_perturbed)
+            # Return final loss if last step (undetached state)
+            if i == self.num_steps:
+                loss = 0.0
+                for state_p, state in zip(states_perturbed, states):
+                    loss += loss_last_fn(state_p, state)
+                loss /= len(states)
+                return loss
+
+            # Compute perturbation loss (detached state)
+            loss = 0.0
+            for state_p, state in zip(states_perturbed, states):
+                loss += loss_fn(state_p, state.detach())
+            loss /= len(states)
+
+            # Compute noise gradient ∂loss/∂noise
+            (noise_gradient,) = torch.autograd.grad(loss, noise)
+            # Move noise towards gradient to change state as much as possible
+            step = noise + self.step_size * noise_gradient
+            # Normalize new noise step into norm induced ball
+            step_norm = self.norm_fn(step)
+            noise = step / (step_norm + self.epsilon)
+            # Reset noise gradients for next step
+            noise = noise.detach().requires_grad_()
+
+
 logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_QUESTION_ANSWERING_MAPPING.keys())
@@ -214,7 +432,6 @@ def train(args, train_dataset, model, tokenizer):
     # Added here for reproductibility
     set_seed(args)
 
-
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -241,9 +458,13 @@ def train(args, train_dataset, model, tokenizer):
             if args.model_type in ["xlnet", "xlm"]:
                 raise NotImplementedError
 
-            outputs = model(**inputs)
-            # model outputs are always tuple in transformers (see doc)
-            loss = outputs[0]
+            if not args.alice:  ## Classic training
+                outputs = model(**inputs)
+                # model outputs are always tuple in transformers (see doc)
+                loss = outputs[0]
+            else:
+                outputs = model(**inputs, use_classic=False)
+                _, loss = outputs   # Hell yes
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
@@ -280,19 +501,19 @@ def train(args, train_dataset, model, tokenizer):
                     logging_loss = tr_loss
 
                 # Save model checkpoint
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
-                    # Take care of distributed/parallel training
-                    model_to_save = model.module if hasattr(model, "module") else model
-                    model_to_save.save_pretrained(output_dir)
-                    tokenizer.save_pretrained(output_dir)
+                # if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                #     output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+                #     # Take care of distributed/parallel training
+                #     model_to_save = model.module if hasattr(model, "module") else model
+                #     model_to_save.save_pretrained(output_dir)
+                #     tokenizer.save_pretrained(output_dir)
 
-                    torch.save(args, os.path.join(output_dir, "training_args.bin"))
-                    logger.info("Saving model checkpoint to %s", output_dir)
+                #     torch.save(args, os.path.join(output_dir, "training_args.bin"))
+                #     logger.info("Saving model checkpoint to %s", output_dir)
 
-                    torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                    torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                    logger.info("Saving optimizer and scheduler states to %s", output_dir)
+                #     torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                #     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                #     logger.info("Saving optimizer and scheduler states to %s", output_dir)
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -709,6 +930,13 @@ def main():
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
     parser.add_argument("--keep_frac", type=float, default=1.0, help="The fraction of the balanced dataset to keep.")
+
+    # ALICE
+    parser.add_argument("--vat-loss-weight", type=float, default=1.0)
+    parser.add_argument("--step-size", type=float, default=1e-3)
+    parser.add_argument("--epsilon", type=float, default=1e-6)
+    parser.add_argument("--noise-var", type=float, default=1e-5)
+    parser.add_argument("--alice", action="store_true")
     args = parser.parse_args()
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
@@ -794,6 +1022,10 @@ def main():
         config=config,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
+
+    if args.alice:
+        extracted_model = ExtractedRoBERTaForQA(model)
+        model = ALICEQAModel(extracted_model, args)
 
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
