@@ -25,7 +25,7 @@ Modified version of "squad_metrics.py" adapated for CUAD.
 
 
 import collections
-import json
+import functools
 import math
 import re
 import string
@@ -33,9 +33,15 @@ import json
 
 from transformers.models.bert import BasicTokenizer
 from transformers.utils import logging
+from tqdm import tqdm
 
 
 logger = logging.get_logger(__name__)
+
+_PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+    "PrelimPrediction", ["feature_index", "start_index", "end_index", "start_logit", "end_logit"]
+)
+
 
 def reformat_predicted_string(remaining_contract, predicted_string):
     tokens = predicted_string.split()
@@ -419,7 +425,7 @@ def _compute_softmax(scores):
     return probs
 
 
-def compute_predictions_logits(
+def compute_predictions_logits_old(
     json_input_dict,
     all_examples,
     all_features,
@@ -450,10 +456,6 @@ def compute_predictions_logits(
     unique_id_to_result = {}
     for result in all_results:
         unique_id_to_result[result.unique_id] = result
-
-    _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
-        "PrelimPrediction", ["feature_index", "start_index", "end_index", "start_logit", "end_logit"]
-    )
 
     all_predictions = collections.OrderedDict()
     all_nbest_json = collections.OrderedDict()
@@ -644,6 +646,262 @@ def compute_predictions_logits(
         with open(output_null_log_odds_file, "w") as writer:
             writer.write(json.dumps(scores_diff_json, indent=4) + "\n")
 
+    logger.info("Done writing.")
     return all_predictions
 
+def compute_predictions_logits(
+        json_input_dict,
+        all_examples,
+        all_features,
+        all_results,
+        n_best_size,
+        max_answer_length,
+        do_lower_case,
+        output_prediction_file,
+        output_nbest_file,
+        output_null_log_odds_file,
+        verbose_logging,
+        version_2_with_negative,
+        null_score_diff_threshold,
+        tokenizer,
+):
+    """Write final predictions to the json file and log-odds of null if needed."""
+    if output_prediction_file:
+        logger.info(f"Writing predictions to: {output_prediction_file}")
+    if output_nbest_file:
+        logger.info(f"Writing nbest to: {output_nbest_file}")
+    if output_null_log_odds_file and version_2_with_negative:
+        logger.info(f"Writing null_log_odds to: {output_null_log_odds_file}")
 
+    example_index_to_features = collections.defaultdict(list)
+    for feature in all_features:
+        example_index_to_features[feature.example_index].append(feature)
+
+    unique_id_to_result = {}
+    for result in all_results:
+        unique_id_to_result[result.unique_id] = result
+
+    contract_name_to_idx = {}
+    for idx in range(len(json_input_dict["data"])):
+        contract_name_to_idx[json_input_dict["data"][idx]["title"]] = idx
+
+
+    from tqdm.contrib.concurrent import process_map
+    jobs = list(enumerate(all_examples))
+
+    all_predictions = collections.OrderedDict()
+    all_nbest_json = collections.OrderedDict()
+    all_scores_diff_json = collections.OrderedDict()
+
+    worker = functools.partial(
+        _worker,
+        example_index_to_features=example_index_to_features,
+        contract_name_to_idx=contract_name_to_idx,
+        json_input_dict=json_input_dict,
+        n_best_size=n_best_size,
+        unique_id_to_result=unique_id_to_result,
+        version_2_with_negative=version_2_with_negative,
+        max_answer_length=max_answer_length,
+        tokenizer=tokenizer,
+        do_lower_case=do_lower_case,
+        verbose_logging=verbose_logging,
+        null_score_diff_threshold=null_score_diff_threshold,
+    )
+
+    for preds, nbests, score_diffs in process_map(worker, jobs, max_workers=8):
+        all_predictions.update(preds)
+        all_nbest_json.update(nbests)
+        all_scores_diff_json.update(score_diffs)
+
+    if output_prediction_file:
+        with open(output_prediction_file, "w") as writer:
+            writer.write(json.dumps(all_predictions, indent=4) + "\n")
+
+    if output_nbest_file:
+        with open(output_nbest_file, "w") as writer:
+            writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
+
+    if output_null_log_odds_file and version_2_with_negative:
+        with open(output_null_log_odds_file, "w") as writer:
+            writer.write(json.dumps(all_scores_diff_json, indent=4) + "\n")
+
+    logger.info("Done writing.")
+    return all_predictions
+
+def _worker(job, example_index_to_features, contract_name_to_idx, json_input_dict, n_best_size, unique_id_to_result,
+           version_2_with_negative, max_answer_length, tokenizer, do_lower_case, verbose_logging, null_score_diff_threshold):
+        my_all_predictions = collections.OrderedDict()
+        my_all_nbest_json = collections.OrderedDict()
+        my_scores_diff_json = collections.OrderedDict()
+        example_index, example = job
+        features = example_index_to_features[example_index]
+
+        contract_name = example.title
+        contract_index = contract_name_to_idx[contract_name]
+        paragraphs = json_input_dict["data"][contract_index]["paragraphs"]
+        assert len(paragraphs) == 1
+
+        prelim_predictions = []
+        # keep track of the minimum score of null start+end of position 0
+        score_null = 1000000  # large and positive
+        min_null_feature_index = 0  # the paragraph slice with min null score
+        null_start_logit = 0  # the start logit at the slice with min null score
+        null_end_logit = 0  # the end logit at the slice with min null score
+        for (feature_index, feature) in enumerate(features):
+            result = unique_id_to_result[feature.unique_id]
+            start_indexes = _get_best_indexes(result.start_logits, n_best_size)
+            end_indexes = _get_best_indexes(result.end_logits, n_best_size)
+            # if we could have irrelevant answers, get the min score of irrelevant
+            if version_2_with_negative:
+                feature_null_score = result.start_logits[0] + result.end_logits[0]
+                if feature_null_score < score_null:
+                    score_null = feature_null_score
+                    min_null_feature_index = feature_index
+                    null_start_logit = result.start_logits[0]
+                    null_end_logit = result.end_logits[0]
+            for start_index in start_indexes:
+                for end_index in end_indexes:
+                    # We could hypothetically create invalid predictions, e.g., predict
+                    # that the start of the span is in the question. We throw out all
+                    # invalid predictions.
+                    if start_index >= len(feature.tokens):
+                        continue
+                    if end_index >= len(feature.tokens):
+                        continue
+                    if start_index not in feature.token_to_orig_map:
+                        continue
+                    if end_index not in feature.token_to_orig_map:
+                        continue
+                    if not feature.token_is_max_context.get(start_index, False):
+                        continue
+                    if end_index < start_index:
+                        continue
+                    length = end_index - start_index + 1
+                    if length > max_answer_length:
+                        global overcount_count
+                        overcount_count += 1
+                        print("warning! overcount.")
+                        continue
+                    prelim_predictions.append(
+                        _PrelimPrediction(
+                            feature_index=feature_index,
+                            start_index=start_index,
+                            end_index=end_index,
+                            start_logit=result.start_logits[start_index],
+                            end_logit=result.end_logits[end_index],
+                        )
+                    )
+        if version_2_with_negative:
+            prelim_predictions.append(
+                _PrelimPrediction(
+                    feature_index=min_null_feature_index,
+                    start_index=0,
+                    end_index=0,
+                    start_logit=null_start_logit,
+                    end_logit=null_end_logit,
+                )
+            )
+        prelim_predictions = sorted(prelim_predictions, key=lambda x: (x.start_logit + x.end_logit), reverse=True)
+
+        _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+            "NbestPrediction", ["text", "start_logit", "end_logit"]
+        )
+
+        seen_predictions = {}
+        nbest = []
+        start_indexes = []
+        end_indexes = []
+        for pred in prelim_predictions:
+            if len(nbest) >= n_best_size:
+                break
+            feature = features[pred.feature_index]
+            if pred.start_index > 0:  # this is a non-null prediction
+                tok_tokens = feature.tokens[pred.start_index : (pred.end_index + 1)]
+                orig_doc_start = feature.token_to_orig_map[pred.start_index]
+                orig_doc_end = feature.token_to_orig_map[pred.end_index]
+                orig_tokens = example.doc_tokens[orig_doc_start : (orig_doc_end + 1)]
+
+                tok_text = tokenizer.convert_tokens_to_string(tok_tokens)
+
+                # Clean whitespace
+                tok_text = tok_text.strip()
+                tok_text = " ".join(tok_text.split())
+                orig_text = " ".join(orig_tokens)
+
+                final_text = get_final_text(tok_text, orig_text, do_lower_case, verbose_logging)
+
+                if final_text in seen_predictions:
+                    continue
+
+                seen_predictions[final_text] = True
+
+                start_indexes.append(orig_doc_start)
+                end_indexes.append(orig_doc_end)
+            else:
+                final_text = ""
+                seen_predictions[final_text] = True
+
+                start_indexes.append(-1)
+                end_indexes.append(-1)
+
+            nbest.append(_NbestPrediction(text=final_text, start_logit=pred.start_logit, end_logit=pred.end_logit))
+
+        # if we didn't include the empty option in the n-best, include it
+        if version_2_with_negative:
+            if "" not in seen_predictions:
+                nbest.append(_NbestPrediction(text="", start_logit=null_start_logit, end_logit=null_end_logit))
+                start_indexes.append(-1)
+                end_indexes.append(-1)
+
+            # In very rare edge cases we could only have single null prediction.
+            # So we just create a nonce prediction in this case to avoid failure.
+            if len(nbest) == 1:
+                nbest.insert(0, _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
+                start_indexes.append(-1)
+                end_indexes.append(-1)
+
+        # In very rare edge cases we could have no valid predictions. So we
+        # just create a nonce prediction in this case to avoid failure.
+        if not nbest:
+            nbest.append(_NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
+            start_indexes.append(-1)
+            end_indexes.append(-1)
+
+        assert len(nbest) >= 1, "No valid predictions"
+        assert len(nbest) == len(start_indexes), "nbest length: {}, start_indexes length: {}".format(len(nbest), len(start_indexes))
+
+        total_scores = []
+        best_non_null_entry = None
+        for entry in nbest:
+            total_scores.append(entry.start_logit + entry.end_logit)
+            if not best_non_null_entry:
+                if entry.text:
+                    best_non_null_entry = entry
+
+        probs = _compute_softmax(total_scores)
+
+        nbest_json = []
+        for (i, entry) in enumerate(nbest):
+            output = collections.OrderedDict()
+            output["text"] = entry.text
+            output["probability"] = probs[i]
+            output["start_logit"] = entry.start_logit
+            output["end_logit"] = entry.end_logit
+            output["token_doc_start"] = start_indexes[i]
+            output["token_doc_end"] = end_indexes[i]
+            nbest_json.append(output)
+
+        assert len(nbest_json) >= 1, "No valid predictions"
+
+        if not version_2_with_negative:
+            my_all_predictions[example.qas_id] = nbest_json[0]["text"]
+        else:
+            # predict "" iff the null score - the score of best non-null > threshold
+            score_diff = score_null - best_non_null_entry.start_logit - (best_non_null_entry.end_logit)
+            my_scores_diff_json[example.qas_id] = score_diff
+            if score_diff > null_score_diff_threshold:
+                my_all_predictions[example.qas_id] = ""
+            else:
+                my_all_predictions[example.qas_id] = best_non_null_entry.text
+        my_all_nbest_json[example.qas_id] = nbest_json
+        return my_all_predictions, my_all_nbest_json, my_scores_diff_json

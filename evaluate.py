@@ -6,18 +6,6 @@ from sklearn import metrics
 
 IOU_THRESH = 0.5
 
-def get_questions_from_csv():
-    df = pd.read_csv("category_descriptions.csv")
-    q_dict = {}
-    for i in range(df.shape[0]):
-        category = df.iloc[i, 0].split("Category: ")[1]
-        description = df.iloc[i, 1].split("Description: ")[1]
-        q_dict[category.title()] = description
-    return q_dict
-
-qtype_dict = get_questions_from_csv()
-
-
 def load_json(path):
     with open(path, "r") as f:
         dict = json.load(f)
@@ -81,7 +69,8 @@ def compute_precision_recall(gt_dict, preds_dict, category=None):
         if category and category not in key:
             continue
 
-        substr_ok = "Parties" in key
+        # substr_ok = "Parties" in key
+        substr_ok = False
 
         answers = gt_dict[key]
         preds = preds_dict[key]
@@ -129,7 +118,6 @@ def compute_precision_recall(gt_dict, preds_dict, category=None):
 
     precision = tp / (tp + fp) if tp + fp > 0 else np.nan
     recall = tp / (tp + fn) if tp + fn > 0 else np.nan
-
     return precision, recall
 
 
@@ -162,7 +150,7 @@ def get_precisions_recalls(pred_dict, gt_dict, category=None):
     precisions = [1]
     recalls = [0]
     confs = []
-    for conf in list(np.arange(0.99, 0, -0.01)) + [0.001, 0]:
+    for conf in list(np.arange(0.99, 0, -0.01)) + [1e-4, 1e-5, 0]:
         conf_thresh_pred_dict = get_preds(pred_dict, conf)
         prec, recall = compute_precision_recall(gt_dict, conf_thresh_pred_dict, category=category)
         precisions.append(prec)
@@ -190,6 +178,9 @@ def get_results(model_path, gt_dict, verbose=False):
     precisions, recalls, confs = get_precisions_recalls(pred_dict, gt_dict)
     prec_at_90_recall, _ = get_prec_at_recall(precisions, recalls, confs, recall_thresh=0.9)
     prec_at_80_recall, _ = get_prec_at_recall(precisions, recalls, confs, recall_thresh=0.8)
+    for thres in [0.05, 0.10, 0.15, 0.20, 0.25, 0.3, 0.4, 0.5]:
+        par = get_prec_at_recall(precisions, recalls, confs, recall_thresh=thres)
+        print(f"recall={thres}  prec={par}")
     aupr = get_aupr(precisions, recalls)
 
     if verbose:
@@ -200,17 +191,24 @@ def get_results(model_path, gt_dict, verbose=False):
     return results
 
 
-if __name__ == "__main__":
-    test_json_path = "./data/test.json"
-    model_path = "./trained_models/roberta-base"
-    save_dir = "./results"
-    if not os.path.exists(save_dir): os.mkdir(save_dir)
+import argparse
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model_path", type=str)
+    parser.add_argument("-E", "--eval_split", choices=["dev", "test"], default="dev", type=str)
+    args = parser.parse_args()
 
+    print(f"Evaluating on {args.eval_split} split.")
+    test_json_path = (f"maud_data/maud_squad_split_answers/maud_squad_{args.eval_split}.json")
     gt_dict = load_json(test_json_path)
     gt_dict = get_answers(gt_dict)
 
-    results = get_results(model_path, gt_dict, verbose=True)
+    results = get_results(args.model_path, gt_dict, verbose=True)
 
-    save_path = os.path.join(save_dir, "{}.json".format(model_path.split("/")[-1]))
+    save_path = os.path.join(args.model_path, "result.json")
     with open(save_path, "w") as f:
         f.write("{}\n".format(results))
+
+
+if __name__ == "__main__":
+    main()
