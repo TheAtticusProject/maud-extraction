@@ -4,7 +4,7 @@ This repository contains the dataset and baseline code for the MAUD supplementar
 extraction task, as described in the appendix of
 "MAUD: An Expert-Annotated Legal NLP Dataset for Merger Agreement Understanding".
 
-For the main MAUD dataset and baselines, see github.com/TheAtticusProject/maud.
+For the main MAUD dataset and baselines, see [github.com/TheAtticusProject/maud](http://github.com/TheAtticusProject/maud).
 
 ## Installation
 ```
