@@ -21,10 +21,10 @@ by lowering the `--threads` count in `run_maud.sh`.
 Training uses around 22 GB of GPU memory.
 
 
-## Validation runs
+## Validation runs (grid-search)
 
 `./run_maud.sh`
 
-## Test runs (using best-found hps)
+## Test runs with best-performing hyperparameters
 
 `./run_maud_best_hp.sh`
