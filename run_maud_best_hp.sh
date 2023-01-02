@@ -26,9 +26,6 @@ for run_num in 1 2 3; do
               --do_train \
               --do_eval \
               --n_best_size 100 \
-
-      echo
-      echo $output_dir
       python evaluate.py -E test $output_dir
     done
   done
