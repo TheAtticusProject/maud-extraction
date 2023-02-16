@@ -9,8 +9,8 @@ for run_num in 1 2 3; do
               --output_dir $output_dir \
               --model_type roberta \
               --model_name_or_path roberta-base \
-              --train_file ~/PycharmProjects/MAUD/scrap/maud_squad_${cache_type}_answers/maud_squad_train.json \
-              --predict_file ~/PycharmProjects/MAUD/scrap/maud_squad_${cache_type}_answers/maud_squad_dev.json \
+              --train_file data/maud_squad_${cache_type}_answers/maud_squad_train.json \
+              --predict_file data/maud_squad_${cache_type}_answers/maud_squad_dev.json \
               --cache_dir ./_cached_features/${eval_mode}/maud_${cache_type} \
               --version_2_with_negative \
               --learning_rate $lr \
