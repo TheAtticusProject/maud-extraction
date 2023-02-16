@@ -1,10 +1,10 @@
 cache_type=split
-eval_mode=valid
+eval_mode=test
 
 for run_num in 1 2 3; do
   for epoch_num in 4; do
     for lr in 1e-4; do
-      output_dir=./train_models/dec_13_test_${cache_type}/n_epoch_${epoch_num}/${run_num}/roberta-base-maud-lr-$lr
+      output_dir=./train_models/test_${cache_type}/n_epoch_${epoch_num}/${run_num}/roberta-base-maud-lr-$lr
       python train.py \
               --output_dir $output_dir \
               --model_type roberta \
@@ -25,7 +25,7 @@ for run_num in 1 2 3; do
               --threads 6 \
               --do_train \
               --do_eval \
-              --n_best_size 100 \
+              --n_best_size 100
       python evaluate.py -E test $output_dir
     done
   done
