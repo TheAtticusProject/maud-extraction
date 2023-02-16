@@ -1,12 +1,10 @@
 cache_type=split
 eval_mode=valid
 
-# If this is still failling, then I need to clear the cache.
-
 for run_num in 1 2 3; do
   for epoch_num in 4 6 8; do
     for lr in 1e-5 1e-4 3e-5; do  # TRAIN ALL
-      output_dir=./train_models/dec_14_test_${cache_type}/n_epoch_${epoch_num}/${run_num}/roberta-base-maud-lr-$lr
+      output_dir=./train_models/dec_14_valid_${cache_type}/n_epoch_${epoch_num}/${run_num}/roberta-base-maud-lr-$lr
       python train.py \
               --output_dir $output_dir \
               --model_type roberta \
