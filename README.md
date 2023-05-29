@@ -8,7 +8,7 @@ For the main MAUD dataset and baselines, see [github.com/TheAtticusProject/maud]
 
 ## Installation
 ```
-pip install torch transformers tensorboard pandas scikit-learn tqdm
+pip install torch transformers tensorboard pandas scikit-learn tqdm webdataset
 ```
 
 ## Notes

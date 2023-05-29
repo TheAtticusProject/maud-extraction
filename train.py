@@ -29,7 +29,10 @@ import numpy as np
 import pathlib
 import torch
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler, SubsetRandomSampler
+import torchdata
+from torchdata.datapipes.iter import IterableWrapper
 from tqdm import tqdm, trange
+import webdataset as wds
 
 import transformers
 from transformers import (
@@ -102,6 +105,8 @@ def get_random_subset(dataset, keep_frac=1):
 def get_balanced_dataset(dataset):
     """
     returns a new dataset, where positive and negative examples are approximately balanced
+
+    We do this by randomly dropping negative examples.
     """
     pos_mask = get_dataset_pos_mask(dataset)
     neg_mask = [~mask for mask in pos_mask]
@@ -117,17 +122,45 @@ def get_balanced_dataset(dataset):
     subset_dataset = torch.utils.data.Subset(dataset, keep_indices)
     return subset_dataset
 
+
+class BalanceLabels(torchdata.pipeline.iter.IterDataPipe):
+    def __init__(dp: torchdata.pipelines.iter.IterDataPipe):
+        # Calculate the drop_probability
+        self.source = dp
+        npos, nneg = ...
+        assert nneg > npos
+        self.drop_neg_prop = npos / nneg
+
+    def __iter__():
+        for x in self.source:
+            if IS_NEGATIVE(x):
+                if np.random.random() < self.drop_neg_prog:
+                    continue
+            yield x
+
+
+def get_balanced_data_pipeline(dp):
+    """
+    Randomly skips negative examples so that in expectation there is an equal
+    proportion of positive and negative examples.
+    """
+    pass
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
-    if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
+    if args.local_rank != -1:
+        raise NotImplementedError
+    tb_writer = SummaryWriter()
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     if args.keep_frac < 1:
+        # Not implemented for streaming dataset.
+        raise NotImplementedError
         train_dataset = get_random_subset(train_dataset, keep_frac=args.keep_frac)
 
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    # train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_sampler = None
+    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -320,8 +353,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
 
     # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(dataset)
-    eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+    eval_dataloader = DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=False)
 
     # multi-gpu evaluate
     if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
@@ -423,6 +455,110 @@ def evaluate(args, model, tokenizer, prefix=""):
     results = squad_evaluate(examples, predictions)
     print(results)
     return results
+
+
+def stub_save_shard_examples(args, shard: int, n_shards: int):
+    assert n_shards > 0
+    assert shard in range(n_shards)
+    assert args.data_dir is not None
+
+    processor = SquadV2Processor() if args.version_2_with_negative else SquadV1Processor()
+    if evaluate:
+        examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file)
+    else:
+        examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
+
+    cached_features_dir = pathlib.Path(
+        args.cache_dir,
+        "cached_{}_{}_{}".format(
+            "dev" if evaluate else "train",
+            list(filter(None, args.model_name_or_path.split("/"))).pop(),
+            str(args.max_seq_length),
+        )
+    )
+    subset_cached_features_dir = pathlib.Path(
+        args.cache_dir,
+        "balanced_subset_cached_{}_{}_{}".format(
+            "dev" if evaluate else "train",
+            list(filter(None, args.model_name_or_path.split("/"))).pop(),
+            str(args.max_seq_length),
+        ),
+    )
+    subset_features_dir.mkdir(parents=True, exist_ok=True)
+    cached_features_dir.mkdir(parents=True, exist_ok=True)
+
+    for shard in range(n_shards):
+        features, dataset = squad_convert_examples_to_features(
+            examples=examples[shard::n_shards],
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            doc_stride=args.doc_stride,
+            max_query_length=args.max_query_length,
+            is_training=not evaluate,
+            return_dataset="pt",
+            threads=args.threads,
+        )
+        # Now save to disk to avoid OOMing.
+
+        filename = f"shard-{shard:03}.tar"
+        subset_path = subset_cached_features_dir / filename
+        cached_path = cached_features_dir / filename
+
+        assert len(features) == len(dataset)
+        N = len(features)
+        with wds.TarWriter(subset_path) as sink:
+            for i in range(N):
+                sink.write(dict(
+                    __key__=i,
+                    features=features[i],
+                ))
+
+
+
+
+def make_cached_features(args, tokenizer, evaluate=False, output_examples=False):
+    """Pytorch-only sharded version of load_and_cache_examples."""
+    if args.local_rank not in [-1, 0]:
+        raise NotImplementedError()
+
+
+def save_cached_features_stub():
+    # Load data features from cache or dataset file
+    input_dir = args.data_dir if args.data_dir else "."
+    cached_features_dir = pathlib.Path(
+        args.cache_dir,
+        "cached_{}_{}_{}".format(
+            "dev" if evaluate else "train",
+            list(filter(None, args.model_name_or_path.split("/"))).pop(),
+            str(args.max_seq_length),
+        )
+    )
+    subset_cached_features_dir = pathlib.Path(
+        args.cache_dir,
+        "balanced_subset_cached_{}_{}_{}".format(
+            "dev" if evaluate else "train",
+            list(filter(None, args.model_name_or_path.split("/"))).pop(),
+            str(args.max_seq_length),
+        ),
+    )
+    subset_features_dir.mkdir(parents=True, exist_ok=True)
+    cached_features_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"shard_{shard_num:03}.tar"
+
+    subset_path = subset_cached_features_dir / filename
+    cached_path = cached_features_dir / filename
+
+    features, dataset = squad_convert_examples_to_features(
+        examples=examples,
+        tokenizer=tokenizer,
+        max_seq_length=args.max_seq_length,
+        doc_stride=args.doc_stride,
+        max_query_length=args.max_query_length,
+        is_training=not evaluate,
+        return_dataset="pt",
+        threads=args.threads,
+    )
+
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):

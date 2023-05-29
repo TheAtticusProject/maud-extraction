@@ -43,7 +43,9 @@ _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
 )
 
 
-def reformat_predicted_string(remaining_contract, predicted_string):
+def reformat_predicted_string(remaining_contract: str, predicted_string: str) -> str:
+    """Finds a substring of `remaining_contract` matching `predicted_string`, possibly
+    including omitted tokens between the words of `predicted_string`."""
     tokens = predicted_string.split()
     assert len(tokens) > 0
     end_idx = 0
@@ -57,7 +59,9 @@ def reformat_predicted_string(remaining_contract, predicted_string):
     return remaining_contract[start_idx:end_idx]
 
 
-def find_char_start_idx(contract, preceeding_tokens, predicted_string):
+def find_char_start_idx(contract: str, preceeding_tokens: "Sequence[str]", predicted_string) -> int:
+    """Find the index of `predicted_string` inside contract, after skipping a preamble in the
+    contract that contains all of strings in `preceeding_tokens`."""
     contract = " ".join(contract.split())
     assert predicted_string in contract
     if contract.count(predicted_string) == 1:
@@ -103,6 +107,7 @@ def get_tokens(s):
 
 
 def compute_exact(a_gold, a_pred):
+    """Computer exact score for a single gold answer (from a single question)."""
     return int(normalize_answer(a_gold) == normalize_answer(a_pred))
 
 
@@ -148,6 +153,8 @@ def get_raw_scores(examples, preds):
     return exact_scores, f1_scores
 
 
+# Applied post-hoc to exact_scores and f1_scores as outputted by `get_raw_scores`
+# in order to account for questions where N/A is the correct answer.
 def apply_no_ans_threshold(scores, na_probs, qid_to_has_ans, na_prob_thresh):
     new_scores = {}
     for qid, s in scores.items():
@@ -159,6 +166,8 @@ def apply_no_ans_threshold(scores, na_probs, qid_to_has_ans, na_prob_thresh):
     return new_scores
 
 
+# TODO(shwang): I can use qid_list to filter for a particular category
+#   or answer type in MAUD.
 def make_eval_dict(exact_scores, f1_scores, qid_list=None):
     if not qid_list:
         total = len(exact_scores)
@@ -185,11 +194,14 @@ def merge_eval(main_eval, new_eval, prefix):
         main_eval["%s_%s" % (prefix, k)] = new_eval[k]
 
 
-def find_best_thresh_v2(preds, scores, na_probs, qid_to_has_ans):
+"""Find the best threshold for N/A probability."""
+def find_best_thresh_v2(preds: dict, scores: dict, na_probs: dict, qid_to_has_ans):
     num_no_ans = sum(1 for k in qid_to_has_ans if not qid_to_has_ans[k])
     cur_score = num_no_ans
     best_score = cur_score
     best_thresh = 0.0
+    # Why do we sort by increasing likelihood of N/A answer, as predicted by
+    #   the model?
     qid_list = sorted(na_probs, key=lambda k: na_probs[k])
     for i, qid in enumerate(qid_list):
         if qid not in scores:
@@ -197,6 +209,7 @@ def find_best_thresh_v2(preds, scores, na_probs, qid_to_has_ans):
         if qid_to_has_ans[qid]:
             diff = scores[qid]
         else:
+            # If the prediction is non-empty (two ways to indicate no answer).
             if preds[qid]:
                 diff = -1
             else:
