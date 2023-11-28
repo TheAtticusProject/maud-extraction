@@ -6,6 +6,8 @@ extraction task, as described in the appendix of
 
 For the main MAUD dataset and baselines, see [github.com/TheAtticusProject/maud](http://github.com/TheAtticusProject/maud).
 
+**bugs**: The baselines reported in the papers are underperforming due to a training bug. See https://github.com/TheAtticusProject/maud-extraction/issues/1 .
+
 ## Installation
 ```
 pip install torch transformers tensorboard pandas scikit-learn tqdm
